@@ -1,7 +1,7 @@
 # PRD — AI QA Regression Testing Agent
 
 **Product:** QA Sentinel — an n8n-orchestrated, AI-assisted regression testing agent
-**Doc owner:** QA Platform Team
+**Doc owner:** Martin Justin
 **Status:** v1.1
 **Last updated:** 2026-07-06
 
