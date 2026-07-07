@@ -1,0 +1,1076 @@
+{
+  "name": "AI QA Regression Testing Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule_trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1600,
+        -208
+      ],
+      "notesInFlow": false,
+      "notes": "Nightly regression run at 02:00 server time. Adjust cron as needed."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qa-regression-trigger",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ci_cd_webhook_trigger",
+      "name": "CI/CD Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1600,
+        112
+      ],
+      "webhookId": "68b96174-b94f-4c86-80b4-3de14f71dbc2",
+      "notesInFlow": false,
+      "notes": "On-demand trigger from CI/CD after a deploy. Body: { tags: string[], build_id: string }. Protected with a Header Auth credential (shared secret) so only CI/CD can invoke it."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const isWebhook = $json.headers !== undefined || $json.body !== undefined;\nlet tags = [];\nlet buildId = null;\nlet source = 'schedule';\nif (isWebhook) {\n  source = 'webhook';\n  const body = $json.body || {};\n  tags = Array.isArray(body.tags) ? body.tags : [];\n  buildId = body.build_id || null;\n}\nreturn { json: { source, tags, build_id: buildId } };"
+      },
+      "id": "normalize_trigger_input",
+      "name": "Normalize Trigger Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1360,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Unifies the Schedule Trigger and Webhook Trigger into one common shape: { source, tags, build_id }."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const rand = Math.random().toString(36).slice(2, 6);\nconst runId = `run_${new Date().toISOString()}_${rand}`;\n// Reset per-run accumulators in workflow static data so re-runs start clean.\nconst staticData = $getWorkflowStaticData('global');\nstaticData['results_' + runId] = [];\nstaticData['skipped_' + runId] = [];\nreturn { json: { ...$json, run_id: runId, started_at: new Date().toISOString() } };"
+      },
+      "id": "initialize_run",
+      "name": "Initialize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1136,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Generates a unique run_id and timestamp carried through the whole run. Also initialises per-run accumulator arrays in workflow static data (keyed by run_id) so aggregation works and concurrent runs never mix results."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID",
+          "cachedResultName": "Select the Test Suite spreadsheet"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Test Suite"
+        },
+        "options": {}
+      },
+      "id": "load_test_suite",
+      "name": "Load Test Suite",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -928,
+        -48
+      ],
+      "notesInFlow": false,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "c49wjEjuYPZEQdTn",
+          "name": "Google Sheets OAuth2 API"
+        }
+      },
+      "notes": "Reads all rows from the 'Test Suite' tab. Column schema documented in README / sample_test_suite.csv."
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Initialize Run').first().json;\nconst tagFilter = run.tags || [];\nconst requiredByType = {\n  api: ['endpoint', 'method'],\n  db: ['db_query'],\n  ui: ['ui_runner_webhook', 'ui_script_id']\n};\n\nfunction parseMaybeJson(val) {\n  if (val == null || val === '') return undefined;\n  if (typeof val === 'object') return val;\n  try { return JSON.parse(val); } catch (e) { return val; }\n}\n\nconst valid = [];\nconst skipped = [];\n\nfor (const item of $input.all()) {\n  const row = item.json;\n  if (String(row.active).toLowerCase() !== 'true') continue;\n  if (tagFilter.length) {\n    const rowTags = String(row.tags || '').split(',').map(t => t.trim()).filter(Boolean);\n    if (!rowTags.some(t => tagFilter.includes(t))) continue;\n  }\n  const req = requiredByType[row.test_type] || [];\n  const missing = req.filter(f => row[f] === undefined || row[f] === null || row[f] === '');\n  if (missing.length) {\n    skipped.push({ test_id: row.test_id, test_type: row.test_type, reason: `missing fields: ${missing.join(', ')}` });\n    continue;\n  }\n  valid.push({\n    ...row,\n    // Coerce JSON-in-cells into real objects/arrays for downstream nodes.\n    headers: parseMaybeJson(row.headers) || {},\n    body: parseMaybeJson(row.body),\n    expected_key_values: parseMaybeJson(row.expected_key_values) || {},\n    expected_schema: parseMaybeJson(row.expected_schema),\n    dynamic_fields: (function () {\n      const df = parseMaybeJson(row.dynamic_fields);\n      if (Array.isArray(df)) return df;\n      if (typeof df === 'string') return df.split(',').map(s => s.trim()).filter(Boolean);\n      return [];\n    })(),\n    expected_status: row.expected_status !== undefined && row.expected_status !== '' ? Number(row.expected_status) : null,\n    known_flaky: String(row.known_flaky).toLowerCase() === 'true',\n    run_id: run.run_id,\n    source: run.source\n  });\n}\n\nconst staticData = $getWorkflowStaticData('global');\nstaticData['skipped_' + run.run_id] = skipped;\n\nreturn valid.map(v => ({ json: v }));"
+      },
+      "id": "validate_and_filter_tests",
+      "name": "Validate & Filter Tests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -704,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Filters to active + tag-matching tests, coerces JSON-in-cells (headers/body/expected_key_values/expected_schema/dynamic_fields) into real objects, normalizes types. Invalid rows are skipped (not fatal) and recorded per run for the final report."
+    },
+    {
+      "parameters": {
+        "batchSize": 5,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "batch_controller",
+      "name": "Batch Controller",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -464,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Controls execution concurrency (default 5). Output 0 = done -> Aggregate. Output 1 = loop -> per-test execution chain, which feeds back into this node's input to continue the loop."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "api",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "api"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "db",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "db"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "ui",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "ui"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "unsupported"
+        }
+      },
+      "id": "route_by_test_type",
+      "name": "Route by Test Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -224,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Routes each test to its execution method. Unsupported test_type values fall through to 'extra' -> Normalize Result Shape marks them unsupported instead of erroring."
+    },
+    {
+      "parameters": {
+        "method": "={{$json.method}}",
+        "url": "={{$json.endpoint}}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ $json.headers || {} }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body || {} }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "execute_api_test",
+      "name": "Execute API Test",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        48,
+        -256
+      ],
+      "notesInFlow": false,
+      "notes": "Executes the API test as configured in the sheet. neverError=true so 4xx/5xx responses are captured as data (that's the point of a regression test), not thrown as node errors."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{$json.db_query}}",
+        "options": {}
+      },
+      "id": "execute_db_query",
+      "name": "Execute DB Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        48,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Runs the configured read-only verification query for db-type tests."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.ui_runner_webhook}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { script_id: $json.ui_script_id, test_id: $json.test_id } }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "trigger_ui_runner",
+      "name": "Trigger UI Runner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        48,
+        160
+      ],
+      "notesInFlow": false,
+      "notes": "Delegates browser automation to an external Playwright/Selenium microservice; n8n only orchestrates. Expected response: { status, screenshot_match_score, extracted_text }."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Carry the original test config forward from the loop input (Batch Controller),\n// then attach the normalized 'actual' result. This keeps expected_* fields intact\n// even though the execution nodes only return the raw response.\nconst cfg = $('Batch Controller').item.json;\nconst raw = $json;\nlet actual = {};\nif (cfg.test_type === 'api') {\n  const headers = raw.headers || {};\n  actual = {\n    status: raw.statusCode != null ? raw.statusCode : raw.status,\n    body: raw.body != null ? raw.body : (raw.data != null ? raw.data : {}),\n    latency_ms: headers['x-response-time'] != null ? Number(headers['x-response-time']) : null\n  };\n} else if (cfg.test_type === 'db') {\n  actual = { status: null, body: Array.isArray(raw) ? raw : raw, latency_ms: null };\n} else if (cfg.test_type === 'ui') {\n  const b = raw.body != null ? raw.body : raw;\n  actual = { status: b.status != null ? b.status : (raw.statusCode != null ? raw.statusCode : null), body: b, latency_ms: null };\n} else {\n  actual = { status: null, body: null, latency_ms: null, unsupported: true };\n}\nreturn { json: { ...cfg, actual } };"
+      },
+      "id": "normalize_result_shape",
+      "name": "Normalize Result Shape",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Maps the three raw execution shapes (API/DB/UI) into one common { expected_*, actual } contract. Re-reads test config from Batch Controller so expected values survive the execution nodes. Adjust field mapping to your real API/runner response shapes."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const t = $json;\nconst mismatches = [];\nconst dynamic = new Set(t.dynamic_fields || []);\n\nfunction get(obj, path) {\n  return String(path).split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);\n}\n\nif (t.actual && t.actual.unsupported) {\n  return { json: { ...t, deterministic_verdict: 'UNSUPPORTED', mismatches: [{ field: 'test_type', expected: 'api|db|ui', actual: t.test_type }] } };\n}\n\nif (t.expected_status != null && t.actual.status !== t.expected_status) {\n  mismatches.push({ field: 'status', expected: t.expected_status, actual: t.actual.status });\n}\n\nconst kv = t.expected_key_values || {};\nfor (const [key, val] of Object.entries(kv)) {\n  if (key.endsWith('_semantic') || key.endsWith('_min')) continue;\n  const path = key;\n  if (dynamic.has(path)) continue;\n  const actualVal = get(t.actual.body, path);\n  if (JSON.stringify(actualVal) !== JSON.stringify(val)) {\n    mismatches.push({ field: path, expected: val, actual: actualVal });\n  }\n}\n\n// Lightweight required-field check against expected_schema (no external deps).\nif (t.expected_schema && t.expected_schema.required && Array.isArray(t.expected_schema.required)) {\n  for (const field of t.expected_schema.required) {\n    if (get(t.actual.body, field) === undefined) {\n      mismatches.push({ field, expected: 'present (schema-required)', actual: undefined });\n    }\n  }\n}\n\nconst hasSemanticAssertion = Object.keys(kv).some(k => k.endsWith('_semantic'));\nconst deterministic_verdict = (mismatches.length === 0 && !hasSemanticAssertion) ? 'PASS' : 'AMBIGUOUS';\n\nreturn { json: { ...t, deterministic_verdict, mismatches } };"
+      },
+      "id": "deterministic_assertion_engine",
+      "name": "Deterministic Assertion Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "Zero-cost first pass: status code, schema-required fields, and exact key/value match on everything NOT in dynamic_fields. Pure semantic assertions (*_semantic keys) always route to AI. Unsupported test types short-circuit to UNSUPPORTED."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.deterministic_verdict}}",
+              "rightValue": "AMBIGUOUS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "needs_ai_review",
+      "name": "Needs AI Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        784,
+        -48
+      ],
+      "notesInFlow": false,
+      "notes": "TRUE -> escalate to Claude for semantic adjudication (only AMBIGUOUS results). FALSE -> deterministic PASS/UNSUPPORTED is final, no AI call (cost control)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'claude-3-5-sonnet-20241022',\n  max_tokens: 1024,\n  temperature: 0,\n  system: 'You are a senior QA engineer adjudicating one regression test result. Fields listed in dynamic_fields are EXPECTED to vary run-to-run and must never by themselves cause a FAIL. Do not treat cosmetic or reworded text as a failure unless the meaning changed. Respond with STRICT JSON ONLY, no prose, no markdown fences, matching exactly this shape: {\\\"verdict\\\":\\\"PASS|FAIL|FLAKY|NEEDS_REVIEW\\\",\\\"confidence\\\":0.0,\\\"root_cause_category\\\":\\\"REGRESSION|FLAKY|TEST_DATA_ISSUE|ENV_ISSUE|STALE_EXPECTATION|null\\\",\\\"reasoning\\\":\\\"...\\\",\\\"suggested_expected_value\\\":null}',\n  messages: [{\n    role: 'user',\n    content: JSON.stringify({\n      test_id: $json.test_id,\n      test_name: $json.test_name,\n      priority: $json.priority,\n      known_flaky: $json.known_flaky,\n      dynamic_fields: $json.dynamic_fields,\n      expected_status: $json.expected_status,\n      expected_key_values: $json.expected_key_values,\n      actual: $json.actual,\n      deterministic_mismatches: $json.mismatches\n    })\n  }]\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "claude_semantic_diff",
+      "name": "Claude - Semantic Diff",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1024,
+        -176
+      ],
+      "notesInFlow": false,
+      "notes": "Only reached for ambiguous deterministic results. temperature=0 for reproducible verdicts. Requires an 'Anthropic API Key' HTTP Header Auth credential with header name 'x-api-key'. Update model per docs.anthropic.com if needed."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let verdict;\ntry {\n  const resp = $json;\n  const text = (resp.content && resp.content[0] && resp.content[0].text) || '{}';\n  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();\n  verdict = JSON.parse(clean);\n  if (!verdict || typeof verdict.verdict !== 'string') throw new Error('missing verdict');\n} catch (e) {\n  verdict = { verdict: 'NEEDS_REVIEW', confidence: 0, root_cause_category: 'ENV_ISSUE', reasoning: 'AI response could not be parsed; flagged for manual review.', suggested_expected_value: null };\n}\nconst testContext = $('Needs AI Review?').item.json;\nreturn { json: { ...testContext, ai_verdict: verdict } };"
+      },
+      "id": "parse_ai_verdict",
+      "name": "Parse AI Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        -176
+      ],
+      "notesInFlow": false,
+      "notes": "Defensively parses Claude's JSON (strips code fences). Any parse/timeout failure degrades gracefully to NEEDS_REVIEW rather than crashing the run."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $json;\nlet final;\nif (item.ai_verdict) {\n  const v = item.ai_verdict;\n  final = {\n    test_id: item.test_id,\n    test_name: item.test_name || null,\n    verdict: v.verdict,\n    source: 'ai',\n    confidence: v.confidence,\n    root_cause_category: v.root_cause_category,\n    reasoning: v.reasoning,\n    suggested_expected_value: v.suggested_expected_value != null ? v.suggested_expected_value : null,\n    mismatches: item.mismatches || [],\n    priority: item.priority,\n    known_flaky: item.known_flaky,\n    endpoint: item.endpoint || null,\n    run_id: item.run_id\n  };\n} else if (item.deterministic_verdict === 'UNSUPPORTED') {\n  final = {\n    test_id: item.test_id,\n    test_name: item.test_name || null,\n    verdict: 'NEEDS_REVIEW',\n    source: 'deterministic',\n    confidence: 0,\n    root_cause_category: 'TEST_DATA_ISSUE',\n    reasoning: 'Unsupported test_type; no execution branch handled this test.',\n    suggested_expected_value: null,\n    mismatches: item.mismatches || [],\n    priority: item.priority,\n    known_flaky: item.known_flaky,\n    endpoint: item.endpoint || null,\n    run_id: item.run_id\n  };\n} else {\n  final = {\n    test_id: item.test_id,\n    test_name: item.test_name || null,\n    verdict: 'PASS',\n    source: 'deterministic',\n    confidence: 1,\n    root_cause_category: null,\n    reasoning: 'All deterministic assertions passed; no AI call was needed.',\n    suggested_expected_value: null,\n    mismatches: [],\n    priority: item.priority,\n    known_flaky: item.known_flaky,\n    endpoint: item.endpoint || null,\n    run_id: item.run_id\n  };\n}\n// Accumulate into per-run static data so the 'done' branch can aggregate\n// (SplitInBatches 'done' output only emits the ORIGINAL input, not these merged records).\nconst staticData = $getWorkflowStaticData('global');\nconst key = 'results_' + final.run_id;\nif (!Array.isArray(staticData[key])) staticData[key] = [];\nstaticData[key].push(final);\nreturn { json: final };"
+      },
+      "id": "merge_final_verdict",
+      "name": "Merge Final Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1024,
+        128
+      ],
+      "notesInFlow": false,
+      "notes": "Produces the final per-test record (deterministic-only or AI-adjudicated) AND pushes it into per-run static data so aggregation has the full result set. Feeds back into Batch Controller to continue the loop."
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Initialize Run').first().json;\nconst runId = run.run_id;\nconst staticData = $getWorkflowStaticData('global');\nconst results = Array.isArray(staticData['results_' + runId]) ? staticData['results_' + runId] : [];\nconst skipped = Array.isArray(staticData['skipped_' + runId]) ? staticData['skipped_' + runId] : [];\n\nconst counts = { pass: 0, fail: 0, flaky: 0, needs_review: 0 };\nfor (const r of results) {\n  if (r.verdict === 'PASS') counts.pass++;\n  else if (r.verdict === 'FLAKY') counts.flaky++;\n  else if (r.verdict === 'NEEDS_REVIEW') counts.needs_review++;\n  else counts.fail++;\n}\n\nconst failures = results.filter(r => r.verdict === 'FAIL');\n\n// Cluster by (endpoint, root_cause_category) for de-duplicated ticket filing.\nconst clusters = {};\nfor (const f of failures) {\n  const key = `${f.endpoint || 'n/a'} :: ${f.root_cause_category || 'UNKNOWN'}`;\n  if (!clusters[key]) clusters[key] = { endpoint: f.endpoint || null, root_cause_category: f.root_cause_category || 'UNKNOWN', failures: [] };\n  clusters[key].failures.push(f);\n}\n\nconst criticalFail = results.some(r => r.priority === 'critical' && (r.verdict === 'FAIL' || r.verdict === 'NEEDS_REVIEW'));\n\n// Stale-expectation suggestions for human review (written to suggested_updates in Store Run History).\nconst stale = results.filter(r => r.root_cause_category === 'STALE_EXPECTATION' && r.suggested_expected_value != null)\n  .map(r => ({ test_id: r.test_id, suggested_expected_value: r.suggested_expected_value, reasoning: r.reasoning }));\n\n// Clean up this run's accumulator so static data doesn't grow unbounded.\ndelete staticData['results_' + runId];\ndelete staticData['skipped_' + runId];\n\nreturn [{ json: {\n  run_id: runId,\n  source: run.source,\n  build_id: run.build_id || null,\n  started_at: run.started_at,\n  counts,\n  total: results.length,\n  results,\n  failures,\n  clusters,\n  skipped,\n  stale_suggestions: stale,\n  critical_fail: criticalFail\n} }];"
+      },
+      "id": "aggregate_run_results",
+      "name": "Aggregate Run Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "Runs once on Batch Controller 'done'. Reads the accumulated per-run results from static data, computes counts, clusters failures by (endpoint, root_cause_category), collects stale-expectation suggestions, then clears the per-run accumulators."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'claude-3-5-sonnet-20241022',\n  max_tokens: 800,\n  temperature: 0.2,\n  system: 'You are summarizing one regression test run for a release manager. Respond with STRICT JSON ONLY matching exactly: {\\\"risk_rating\\\":\\\"LOW|MEDIUM|HIGH|CRITICAL\\\",\\\"headline\\\":\\\"...\\\",\\\"top_risks\\\":[\\\"...\\\"],\\\"narrative\\\":\\\"2-4 sentences, plain English\\\"}',\n  messages: [{ role: 'user', content: JSON.stringify({ counts: $json.counts, total: $json.total, failures: $json.failures, clusters: $json.clusters, skipped: $json.skipped, critical_fail: $json.critical_fail }) }]\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "claude_executive_summary",
+      "name": "Claude - Executive Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        32,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "Runs once per run (flat cost regardless of suite size). Consumes only aggregated counts/failures, not raw payloads."
+    },
+    {
+      "parameters": {
+        "jsCode": "let summary;\ntry {\n  const resp = $input.first().json;\n  const text = (resp.content && resp.content[0] && resp.content[0].text) || '{}';\n  summary = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim());\n  if (!summary || typeof summary.risk_rating !== 'string') throw new Error('missing risk_rating');\n} catch (e) {\n  summary = { risk_rating: 'MEDIUM', headline: 'Summary unavailable - AI parsing failed', top_risks: [], narrative: 'The executive summary could not be generated automatically; please review results manually.' };\n}\nconst agg = $('Aggregate Run Results').first().json;\nreturn [{ json: { ...agg, ...summary } }];"
+      },
+      "id": "parse_summary_json",
+      "name": "Parse Summary JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "Parses the executive summary; degrades gracefully to a MEDIUM-risk placeholder rather than blocking reporting if the AI call fails."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{$json.risk_rating}}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{$json.risk_rating}}",
+              "rightValue": "CRITICAL",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{$json.critical_fail}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "risk_threshold_exceeded",
+      "name": "Risk Threshold Exceeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        512,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "TRUE -> page the team + file tickets. FALSE -> routine, non-paging summary only."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa-critical-alerts"
+        },
+        "text": "={{ ':rotating_light: *' + $json.headline + '*\\nRisk: ' + $json.risk_rating + ' | Pass ' + $json.counts.pass + ' / Fail ' + $json.counts.fail + ' / Flaky ' + $json.counts.flaky + ' / Needs Review ' + $json.counts.needs_review + '\\nRun: ' + $json.run_id + '\\n' + $json.narrative + '\\n<!here>' }}",
+        "otherOptions": {}
+      },
+      "id": "slack_critical_alert",
+      "name": "Slack - Critical Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        752,
+        272
+      ],
+      "webhookId": "dcdc2f26-7dc8-46a5-9872-ab0a9d2c8ecc",
+      "notesInFlow": false,
+      "notes": "Pages the QA-critical channel with @here. Requires a Slack Bot credential with chat:write scope. Bot must be invited to #qa-critical-alerts."
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst items = [];\nfor (const [key, cluster] of Object.entries(data.clusters || {})) {\n  items.push({ json: {\n    run_id: data.run_id,\n    cluster_key: key,\n    endpoint: cluster.endpoint,\n    root_cause_category: cluster.root_cause_category,\n    failures: cluster.failures,\n    count: cluster.failures.length\n  } });\n}\nreturn items;"
+      },
+      "id": "split_failure_clusters",
+      "name": "Split Failure Clusters",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        464
+      ],
+      "notesInFlow": false,
+      "notes": "One ticket per FAILURE CLUSTER (grouped by endpoint + root_cause_category), not one per test - prevents ticket storms during a systemic outage. Emits zero items when there are no FAIL clusters, which correctly skips ticket creation."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://REPLACE_JIRA_DOMAIN.atlassian.net/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  fields: {\n    project: { key: 'QA' },\n    issuetype: { name: 'Bug' },\n    summary: 'Regression: ' + $json.root_cause_category + ' @ ' + ($json.endpoint || 'n/a') + ' (' + $json.count + ' tests) - run ' + $json.run_id,\n    description: {\n      type: 'doc', version: 1,\n      content: [{ type: 'paragraph', content: [{ type: 'text', text: JSON.stringify($json.failures, null, 2).slice(0, 30000) }] }]\n    }\n  }\n} }}",
+        "options": {}
+      },
+      "id": "create_jira_tickets",
+      "name": "Create Jira Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        992,
+        464
+      ],
+      "notesInFlow": false,
+      "notes": "One ticket per failure cluster. Requires a Jira Basic Auth credential (email + API token). Replace REPLACE_JIRA_DOMAIN and the project key 'QA'. Uses Jira Cloud ADF description format (API v3)."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa-regression"
+        },
+        "text": "={{ ':white_check_mark: *' + $json.headline + '*\\nRisk: ' + $json.risk_rating + ' | Pass ' + $json.counts.pass + ' / Fail ' + $json.counts.fail + ' / Flaky ' + $json.counts.flaky + ' / Needs Review ' + $json.counts.needs_review + '\\nRun: ' + $json.run_id + '\\n' + $json.narrative }}",
+        "otherOptions": {}
+      },
+      "id": "slack_routine_summary",
+      "name": "Slack - Routine Summary",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        752,
+        640
+      ],
+      "webhookId": "bbfd71eb-bce4-4769-9364-b013dbe0004a",
+      "notesInFlow": false,
+      "notes": "Non-paging routine summary posted after every non-critical run. Bot must be invited to #qa-regression."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO qa_run_history (run_id, started_at, source, build_id, pass_count, fail_count, flaky_count, needs_review_count, risk_rating, headline, narrative)\nVALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10);",
+        "options": {
+          "queryReplacement": "={{ $('Parse Summary JSON').first().json.run_id }},={{ $('Parse Summary JSON').first().json.source }},={{ $('Parse Summary JSON').first().json.build_id }},={{ $('Parse Summary JSON').first().json.counts.pass }},={{ $('Parse Summary JSON').first().json.counts.fail }},={{ $('Parse Summary JSON').first().json.counts.flaky }},={{ $('Parse Summary JSON').first().json.counts.needs_review }},={{ $('Parse Summary JSON').first().json.risk_rating }},={{ $('Parse Summary JSON').first().json.headline }},={{ $('Parse Summary JSON').first().json.narrative }}"
+        }
+      },
+      "id": "store_run_history",
+      "name": "Store Run History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1232,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "Persists run-level history via PARAMETERIZED query ($1..$10) - no SQL injection, no manual quote-escaping. Requires a qa_run_history table (see README for DDL). Runs regardless of which reporting branch fired."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{$('Initialize Run').first().json.source}}",
+              "rightValue": "webhook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "triggered_by_webhook",
+      "name": "Triggered By Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1472,
+        432
+      ],
+      "notesInFlow": false,
+      "notes": "Only a webhook-triggered run has a waiting HTTP connection to respond to."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  run_id: $('Parse Summary JSON').first().json.run_id,\n  risk_rating: $('Parse Summary JSON').first().json.risk_rating,\n  pass_count: $('Parse Summary JSON').first().json.counts.pass,\n  fail_count: $('Parse Summary JSON').first().json.counts.fail,\n  flaky_count: $('Parse Summary JSON').first().json.counts.flaky,\n  needs_review_count: $('Parse Summary JSON').first().json.counts.needs_review,\n  headline: $('Parse Summary JSON').first().json.headline\n} }}",
+        "options": {}
+      },
+      "id": "respond_to_webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        1712,
+        352
+      ],
+      "notesInFlow": false,
+      "notes": "Lets a CI/CD pipeline gate a deploy on this run's result."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Trigger Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CI/CD Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Trigger Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Trigger Input": {
+      "main": [
+        [
+          {
+            "node": "Initialize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Run": {
+      "main": [
+        [
+          {
+            "node": "Load Test Suite",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Test Suite": {
+      "main": [
+        [
+          {
+            "node": "Validate & Filter Tests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Filter Tests": {
+      "main": [
+        [
+          {
+            "node": "Batch Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Controller": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Run Results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route by Test Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Test Type": {
+      "main": [
+        [
+          {
+            "node": "Execute API Test",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute DB Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Trigger UI Runner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute API Test": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute DB Query": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger UI Runner": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Result Shape": {
+      "main": [
+        [
+          {
+            "node": "Deterministic Assertion Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deterministic Assertion Engine": {
+      "main": [
+        [
+          {
+            "node": "Needs AI Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs AI Review?": {
+      "main": [
+        [
+          {
+            "node": "Claude - Semantic Diff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Final Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Semantic Diff": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Verdict": {
+      "main": [
+        [
+          {
+            "node": "Merge Final Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Final Verdict": {
+      "main": [
+        [
+          {
+            "node": "Batch Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Run Results": {
+      "main": [
+        [
+          {
+            "node": "Claude - Executive Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Executive Summary": {
+      "main": [
+        [
+          {
+            "node": "Parse Summary JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Summary JSON": {
+      "main": [
+        [
+          {
+            "node": "Risk Threshold Exceeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Threshold Exceeded?": {
+      "main": [
+        [
+          {
+            "node": "Slack - Critical Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Split Failure Clusters",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Routine Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Failure Clusters": {
+      "main": [
+        [
+          {
+            "node": "Create Jira Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Critical Alert": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Jira Tickets": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Routine Summary": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Run History": {
+      "main": [
+        [
+          {
+            "node": "Triggered By Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triggered By Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "51c86ba5-652c-4b36-a82b-f81564967a57",
+  "meta": {
+    "instanceId": "ecb56b742a759b6861a8be57dc1ccf8aeb130152f3fe9238ef32873f14c92b3a"
+  },
+  "nodeGroups": [],
+  "id": "854EqSJ2x3m4d8Pl",
+  "tags": []
+}

@@ -1,0 +1,1621 @@
+{
+  "name": "AI QA Regression Testing Agent",
+  "nodes": [
+    {
+      "id": "schedule_trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1600,
+        -200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "notes": "Nightly regression run at 02:00 server time. Adjust cron as needed.",
+      "notesInFlow": false
+    },
+    {
+      "id": "ci_cd_webhook_trigger",
+      "name": "CI/CD Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1600,
+        100
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qa-regression-trigger",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "On-demand trigger from CI/CD after a deploy. Body: { tags: string[], build_id: string }. Protect with a Header Auth credential (shared secret) in production.",
+      "notesInFlow": false
+    },
+    {
+      "id": "normalize_trigger_input",
+      "name": "Normalize Trigger Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1360,
+        -50
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const isWebhook = $json.headers !== undefined || $json.body !== undefined;\nlet tags = [];\nlet buildId = null;\nlet source = 'schedule';\nlet testSource = 'sheet';\nif (isWebhook) {\n  source = 'webhook';\n  tags = ($json.body && $json.body.tags) || [];\n  buildId = ($json.body && $json.body.build_id) || null;\n  testSource = ($json.body && $json.body.test_source) || 'sheet';\n}\nreturn { json: { source, tags, build_id: buildId, test_source: testSource } };"
+      },
+      "notes": "Unifies the Schedule Trigger and Webhook Trigger into one common shape: { source, tags, build_id, test_source }. test_source defaults to 'sheet'; a webhook caller can pass \"test_source\": \"git\" to load tests from the git-backed JSON source instead.",
+      "notesInFlow": false
+    },
+    {
+      "id": "initialize_run",
+      "name": "Initialize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1140,
+        -50
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const runId = `run_${new Date().toISOString()}_${Math.random().toString(36).slice(2,6)}`;\nreturn { json: { ...$json, run_id: runId, started_at: new Date().toISOString() } };"
+      },
+      "notes": "Generates a unique run_id and timestamp carried through the whole run for history/dedup.",
+      "notesInFlow": false
+    },
+    {
+      "id": "load_test_suite",
+      "name": "Load Test Suite",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -920,
+        -50
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "Test Suite"
+        },
+        "options": {}
+      },
+      "notes": "Reads all rows from the 'Test Suite' tab. Column schema documented in sample_test_suite.csv / README.",
+      "notesInFlow": false
+    },
+    {
+      "id": "validate_&_filter_tests",
+      "name": "Validate & Filter Tests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -700,
+        -50
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const run = $('Initialize Run').first().json;\nconst tagFilter = run.tags || [];\nconst requiredByType = {\n  api: ['endpoint', 'method'],\n  db: ['db_query'],\n  ui: ['ui_runner_webhook', 'ui_script_id']\n};\nconst valid = [];\nconst skipped = [];\n\nfunction parseMaybeJson(val) {\n  if (typeof val !== 'string') return val;\n  try { return JSON.parse(val); } catch (e) { return val; }\n}\n\nfor (const item of $input.all()) {\n  const row = { ...item.json };\n  row.expected_schema = parseMaybeJson(row.expected_schema);\n  row.expected_key_values = parseMaybeJson(row.expected_key_values) || {};\n  row.headers = parseMaybeJson(row.headers);\n  row.body = parseMaybeJson(row.body);\n  row.dynamic_fields = typeof row.dynamic_fields === 'string'\n    ? row.dynamic_fields.split(',').map(s => s.trim()).filter(Boolean)\n    : (row.dynamic_fields || []);\n\n  if (String(row.active).toLowerCase() !== 'true') continue;\n  if (tagFilter.length) {\n    const rowTags = Array.isArray(row.tags) ? row.tags : String(row.tags || '').split(',').map(t => t.trim());\n    if (!rowTags.some(t => tagFilter.includes(t))) continue;\n  }\n  const req = requiredByType[row.test_type] || [];\n  const missing = req.filter(f => !row[f]);\n  if (missing.length) {\n    skipped.push({ test_id: row.test_id, reason: `missing fields: ${missing.join(', ')}` });\n    continue;\n  }\n  valid.push({ ...row, run_id: run.run_id, source: run.source, build_id: run.build_id });\n}\n\nconst staticData = $getWorkflowStaticData('node');\nstaticData.skipped = skipped;\n\nreturn valid.map(v => ({ json: v }));"
+      },
+      "notes": "Filters to active + tag-matching tests. Defensively JSON.parses expected_schema/expected_key_values/headers/body in case the source (Sheet or CSV) stored them as JSON strings rather than native objects; passes through already-parsed objects unchanged (git-backed source case). Validates required fields per test_type; invalid rows are skipped (not fatal) and recorded for the final report. Carries run_id/source/build_id onto every row for downstream history tracking.",
+      "notesInFlow": false
+    },
+    {
+      "id": "batch_controller",
+      "name": "Batch Controller",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -460,
+        -50
+      ],
+      "parameters": {
+        "batchSize": 5,
+        "options": {
+          "reset": false
+        }
+      },
+      "notes": "Controls execution concurrency (default 5 at a time). Output 0 = done (fires once, all items processed) -> Aggregate. Output 1 = loop (current batch) -> per-test execution chain, which must feed back into this node's input to continue the loop.",
+      "notesInFlow": false
+    },
+    {
+      "id": "route_by_test_type",
+      "name": "Route by Test Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -220,
+        -50
+      ],
+      "parameters": {
+        "mode": "expression",
+        "output": "input",
+        "rules": {
+          "values": [
+            {
+              "outputKey": "api",
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "api",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "outputKey": "db",
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "db",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "outputKey": "ui",
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.test_type}}",
+                    "rightValue": "ui",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "notes": "Routes each test case to its execution method. Unsupported test_type values fall through to 'extra' output, which is marked unsupported downstream instead of erroring.",
+      "notesInFlow": false
+    },
+    {
+      "id": "execute_api_test",
+      "name": "Execute API Test",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        40,
+        -260
+      ],
+      "parameters": {
+        "method": "={{$json.method}}",
+        "url": "={{$json.endpoint}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "jsonHeaders": "={{$json.headers}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.body}}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "notes": "Executes the API test exactly as configured in the sheet. neverError=true so 4xx/5xx responses are captured as data (that's the point of a regression test), not thrown as node errors.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "execute_db_query",
+      "name": "Execute DB Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        40,
+        -50
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{$json.db_query}}",
+        "options": {}
+      },
+      "notes": "Runs the configured read-only verification query for db-type tests.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "trigger_ui_runner",
+      "name": "Trigger UI Runner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        40,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.ui_runner_webhook}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { script_id: $json.ui_script_id, test_id: $json.test_id } }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "notes": "Delegates actual browser automation to an external Playwright/Selenium microservice; n8n only orchestrates. Expected response: { status, screenshot_match_score, extracted_text }.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "normalize_result_shape",
+      "name": "Normalize Result Shape",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        -50
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const item = $json;\nlet actual = {};\nif (item.test_type === 'api') {\n  actual = { status: item.statusCode ?? item.status, body: item.body ?? item.data ?? {}, latency_ms: item.headers ? item.headers['x-response-time'] : null };\n} else if (item.test_type === 'db') {\n  actual = { status: null, body: Array.isArray(item) ? item[0] : item, latency_ms: null };\n} else if (item.test_type === 'ui') {\n  actual = { status: item.status ?? item.statusCode, body: item.body ?? item, latency_ms: null };\n} else {\n  actual = { status: null, body: null, latency_ms: null, unsupported: true };\n}\nreturn { json: { ...item, actual } };"
+      },
+      "notes": "Maps the three different raw execution shapes (API/DB/UI) into one common { expected, actual } contract consumed by the Assertion Engine. Adjust field mapping to match your real API/runner response shapes.",
+      "notesInFlow": false
+    },
+    {
+      "id": "deterministic_assertion_engine",
+      "name": "Deterministic Assertion Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        -50
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const t = $json;\nconst mismatches = [];\nconst dynamic = new Set(t.dynamic_fields || []);\n\nfunction get(obj, path) {\n  return path.split('.').reduce((o,k)=> (o||{})[k], obj);\n}\n\nfunction validateSchema(schema, body) {\n  const errors = [];\n  if (!schema || typeof schema !== 'object') return errors;\n  if (schema.type === 'object' && (typeof body !== 'object' || body === null || Array.isArray(body))) {\n    errors.push({ field: '(schema)', expected: 'object', actual: body === null ? 'null' : typeof body });\n    return errors;\n  }\n  for (const key of schema.required || []) {\n    if (body == null || !(key in body)) {\n      errors.push({ field: key, expected: '(required by schema)', actual: 'missing' });\n    }\n  }\n  for (const [key, propSchema] of Object.entries(schema.properties || {})) {\n    if (body == null || !(key in body)) continue;\n    const actualType = Array.isArray(body[key]) ? 'array' : typeof body[key];\n    if (propSchema.type && actualType !== propSchema.type) {\n      errors.push({ field: key, expected: `type ${propSchema.type}`, actual: `type ${actualType}` });\n    }\n  }\n  return errors;\n}\n\nif (t.expected_status != null && t.actual.status !== t.expected_status) {\n  mismatches.push({ field: 'status', expected: t.expected_status, actual: t.actual.status });\n}\n\nmismatches.push(...validateSchema(t.expected_schema, t.actual.body));\n\nconst kv = t.expected_key_values || {};\nfor (const [key, val] of Object.entries(kv)) {\n  if (key.endsWith('_semantic')) continue;\n\n  if (key.endsWith('_min') || key.endsWith('_max')) {\n    const isMin = key.endsWith('_min');\n    const baseField = key.slice(0, -4);\n    if (dynamic.has(baseField) || dynamic.has(key)) continue;\n    const actualVal = get(t.actual.body, baseField);\n    const numActual = Number(actualVal);\n    const numExpected = Number(val);\n    const ok = actualVal != null && !isNaN(numActual) && (isMin ? numActual >= numExpected : numActual <= numExpected);\n    if (!ok) {\n      mismatches.push({ field: baseField, expected: `${isMin ? '>=' : '<='} ${val}`, actual: actualVal });\n    }\n    continue;\n  }\n\n  if (dynamic.has(key)) continue;\n  const actualVal = get(t.actual.body, key);\n  if (JSON.stringify(actualVal) !== JSON.stringify(val)) {\n    mismatches.push({ field: key, expected: val, actual: actualVal });\n  }\n}\n\nconst hasSemanticAssertion = Object.keys(kv).some(k => k.endsWith('_semantic'));\nconst deterministic_verdict = (mismatches.length === 0 && !hasSemanticAssertion) ? 'PASS' : 'AMBIGUOUS';\n\nreturn { json: { ...t, deterministic_verdict, mismatches } };"
+      },
+      "notes": "First-pass, zero-cost verification: (a) status code match, (b) JSON-schema validation against expected_schema (required fields + property type checks), (c) exact key/value match on everything in expected_key_values NOT listed in dynamic_fields, (d) threshold assertions for any expected_key_values key suffixed _min/_max (e.g. count_min: 5 checks actual.count >= 5) against its base field name. Pure semantic assertions (*_semantic keys) always route to AI.",
+      "notesInFlow": false
+    },
+    {
+      "id": "needs_ai_review",
+      "name": "Needs AI Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        -50
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.deterministic_verdict}}",
+              "rightValue": "PASS",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "notes": "TRUE -> escalate to Claude for semantic adjudication. FALSE -> deterministic PASS is final, no AI call (cost control).",
+      "notesInFlow": false
+    },
+    {
+      "id": "claude___semantic_diff",
+      "name": "Claude - Semantic Diff",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        -180
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'claude-sonnet-5',\n  max_tokens: 1024,\n  temperature: 0,\n  system: 'You are a senior QA engineer adjudicating one regression test result. Fields listed in dynamic_fields are EXPECTED to vary run-to-run and must never by themselves cause a FAIL. Do not treat cosmetic or reworded text as a failure unless the meaning changed. Respond with STRICT JSON ONLY, no prose, no markdown fences, matching exactly this shape: {\\\"verdict\\\":\\\"PASS|FAIL|FLAKY|NEEDS_REVIEW\\\",\\\"confidence\\\":0.0,\\\"root_cause_category\\\":\\\"REGRESSION|FLAKY|TEST_DATA_ISSUE|ENV_ISSUE|STALE_EXPECTATION|null\\\",\\\"reasoning\\\":\\\"...\\\",\\\"suggested_expected_value\\\":null}',\n  messages: [{\n    role: 'user',\n    content: JSON.stringify({\n      test_id: $json.test_id,\n      test_name: $json.test_name,\n      priority: $json.priority,\n      known_flaky: $json.known_flaky,\n      dynamic_fields: $json.dynamic_fields,\n      expected_status: $json.expected_status,\n      expected_key_values: $json.expected_key_values,\n      actual: $json.actual,\n      deterministic_mismatches: $json.mismatches\n    })\n  }]\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "notes": "Only reached for ambiguous/failed deterministic results. temperature=0 for reproducible verdicts. Swap model string per current docs.claude.com if needed. Requires an 'Anthropic API Key' HTTP Header Auth credential (header: x-api-key).",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "parse_ai_verdict",
+      "name": "Parse AI Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        -180
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "let verdict;\ntry {\n  const text = ($json.content && $json.content[0] && $json.content[0].text) || '{}';\n  const clean = text.replace(/```json|```/g, '').trim();\n  verdict = JSON.parse(clean);\n} catch (e) {\n  verdict = { verdict: 'NEEDS_REVIEW', confidence: 0, root_cause_category: 'ENV_ISSUE', reasoning: 'AI response could not be parsed; flagged for manual review.', suggested_expected_value: null };\n}\nconst testContext = $('Needs AI Review?').item.json;\nreturn { json: { ...testContext, ai_verdict: verdict } };"
+      },
+      "notes": "Defensively parses Claude's JSON response (strips code fences). Any parse failure degrades gracefully to NEEDS_REVIEW rather than crashing the run.",
+      "notesInFlow": false
+    },
+    {
+      "id": "merge_final_verdict",
+      "name": "Merge Final Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const item = $json;\nlet final;\nif (item.ai_verdict) {\n  final = {\n    test_id: item.test_id,\n    verdict: item.ai_verdict.verdict,\n    source: 'ai',\n    confidence: item.ai_verdict.confidence,\n    root_cause_category: item.ai_verdict.root_cause_category,\n    reasoning: item.ai_verdict.reasoning,\n    suggested_expected_value: item.ai_verdict.suggested_expected_value,\n    visual_diff_description: item.ai_verdict.visual_diff_description || null,\n    mismatches: item.mismatches || [],\n    priority: item.priority,\n    known_flaky: item.known_flaky,\n    run_id: item.run_id,\n    build_id: item.build_id\n  };\n} else {\n  final = {\n    test_id: item.test_id,\n    verdict: 'PASS',\n    source: 'deterministic',\n    confidence: 1,\n    root_cause_category: null,\n    reasoning: 'All deterministic assertions passed; no AI call was needed.',\n    suggested_expected_value: null,\n    visual_diff_description: null,\n    mismatches: [],\n    priority: item.priority,\n    known_flaky: item.known_flaky,\n    run_id: item.run_id,\n    build_id: item.build_id\n  };\n}\nreturn { json: final };"
+      },
+      "notes": "Produces the final, unified per-test result record whether it came from the deterministic-only path, the text semantic-diff path, or the visual-diff path. Carries build_id through for cross-run correlation and visual_diff_description through for UI regressions. Feeds back into Batch Controller to continue the loop.",
+      "notesInFlow": false
+    },
+    {
+      "id": "aggregate_run_results",
+      "name": "Aggregate Run Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const results = $('Batch Controller').all().map(i => i.json);\nconst history = $input.all().map(i => i.json);\nconst runInfo = $('Initialize Run').first().json;\nconst staticData = $getWorkflowStaticData('node');\nconst skipped = staticData.skipped || [];\n\nconst counts = { pass: 0, fail: 0, flaky: 0, needs_review: 0 };\nfor (const r of results) {\n  if (r.verdict === 'PASS') counts.pass++;\n  else if (r.verdict === 'FLAKY') counts.flaky++;\n  else if (r.verdict === 'NEEDS_REVIEW') counts.needs_review++;\n  else counts.fail++;\n}\n\nconst failures = results.filter(r => r.verdict === 'FAIL');\nconst clusters = {};\nfor (const f of failures) {\n  const key = f.root_cause_category || 'UNKNOWN';\n  clusters[key] = clusters[key] || [];\n  clusters[key].push(f);\n}\n\nconst criticalFail = results.some(r => r.priority === 'critical' && (r.verdict === 'FAIL' || r.verdict === 'NEEDS_REVIEW'));\n\n// --- Cross-run pattern intelligence ---\nconst historyByTest = {};\nfor (const h of history) {\n  historyByTest[h.test_id] = historyByTest[h.test_id] || [];\n  historyByTest[h.test_id].push(h);\n}\n\nconst chronic_flaky = [];\nconst recurring_issues = [];\nfor (const r of results) {\n  const priorRuns = (historyByTest[r.test_id] || []).slice(0, 5);\n  const flakyCount = priorRuns.filter(h => h.verdict === 'FLAKY').length + (r.verdict === 'FLAKY' ? 1 : 0);\n  if (flakyCount >= 3) {\n    chronic_flaky.push({ test_id: r.test_id, flaky_runs: flakyCount, window: priorRuns.length + 1 });\n  }\n  if (r.verdict === 'FAIL') {\n    const priorSameCause = priorRuns.filter(h => h.verdict === 'FAIL' && h.root_cause_category === r.root_cause_category);\n    if (priorSameCause.length >= 2) {\n      const earliest = priorSameCause[priorSameCause.length - 1];\n      recurring_issues.push({\n        test_id: r.test_id,\n        root_cause_category: r.root_cause_category,\n        occurrences: priorSameCause.length + 1,\n        first_seen_build: earliest.build_id || earliest.run_id\n      });\n    }\n  }\n}\n\n// --- Tiered autonomy: classify stale-expectation suggestions ---\nconst PROTECTED_FIELD_PATTERN = /price|total|subtotal|discount|amount|cost|balance|currency/i;\nconst AUTO_APPLY_CONFIDENCE = 0.95;\nconst suggested_updates = { auto_apply: [], manual_review: [] };\nfor (const r of results) {\n  if (r.root_cause_category !== 'STALE_EXPECTATION' || r.suggested_expected_value == null) continue;\n  const singleMismatch = (r.mismatches || []).length === 1 ? r.mismatches[0] : null;\n  const entry = {\n    test_id: r.test_id,\n    field: singleMismatch ? singleMismatch.field : null,\n    old_expected: singleMismatch ? singleMismatch.expected : null,\n    suggested_expected: r.suggested_expected_value,\n    reasoning: r.reasoning,\n    confidence: r.confidence,\n    run_id: r.run_id\n  };\n  const eligible = !!singleMismatch\n    && r.priority !== 'critical'\n    && (r.confidence || 0) >= AUTO_APPLY_CONFIDENCE\n    && !PROTECTED_FIELD_PATTERN.test(singleMismatch.field || '');\n  if (eligible) suggested_updates.auto_apply.push(entry);\n  else suggested_updates.manual_review.push(entry);\n}\n\nreturn [{ json: {\n  run_id: results[0] ? results[0].run_id : runInfo.run_id,\n  build_id: runInfo.build_id,\n  counts, total: results.length, failures, clusters, skipped, critical_fail: criticalFail,\n  chronic_flaky, recurring_issues, suggested_updates\n} }];"
+      },
+      "notes": "Runs once after Batch Controller's 'done' output (via Load Recent Test History). Computes pass/fail/flaky/needs-review counts and clusters failures by root_cause_category for de-duplicated ticket filing. Also: (1) cross-run pattern intelligence — flags chronically flaky tests (FLAKY in >=3 of the last 5 runs) and root causes recurring across >=3 runs/builds, using history loaded by 'Load Recent Test History'; (2) classifies every STALE_EXPECTATION suggestion into auto_apply (single mismatched field, confidence >= 0.95, non-critical priority, not a protected/monetary field) vs manual_review — never auto-applies anything itself, just labels it for the downstream nodes.",
+      "notesInFlow": false
+    },
+    {
+      "id": "claude___executive_summary",
+      "name": "Claude - Executive Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'claude-sonnet-5',\n  max_tokens: 800,\n  temperature: 0.2,\n  system: 'You are summarizing one regression test run for a release manager. A risk_rating and risk_score have ALREADY been computed deterministically from the run data and are given to you in the input JSON as risk_rating/risk_score \\u2014 treat them as fixed facts and do not contradict or restate a different rating. If chronic_flaky or recurring_issues are non-empty, call them out explicitly in top_risks since they indicate a pattern across runs, not a one-off. Respond with STRICT JSON ONLY matching exactly: {\\\"headline\\\":\\\"...\\\",\\\"top_risks\\\":[\\\"...\\\"],\\\"narrative\\\":\\\"2-4 sentences, plain English\\\"}',\n  messages: [{ role: 'user', content: JSON.stringify($json) }]\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "notes": "Runs once per run (flat cost regardless of suite size). Consumes the aggregated counts/failures plus the deterministically computed risk_score/risk_rating and cross-run signals \\u2014 it only writes the headline/top_risks/narrative, it does not choose the risk rating itself (see Compute Risk Score).",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "parse_summary_json",
+      "name": "Parse Summary JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "let summary;\ntry {\n  const text = ($json.content && $json.content[0] && $json.content[0].text) || '{}';\n  summary = JSON.parse(text.replace(/```json|```/g, '').trim());\n} catch (e) {\n  summary = { headline: 'Summary unavailable - AI parsing failed', top_risks: [], narrative: 'The executive summary could not be generated automatically; please review results manually.' };\n}\nconst agg = $('Compute Risk Score').first().json;\nreturn [{ json: { ...agg, ...summary } }];"
+      },
+      "notes": "Parses the executive summary narrative and merges it with the deterministically computed risk_score/risk_rating from 'Compute Risk Score' (the AI response never overrides risk_rating \\u2014 that field comes from agg, spread first). Degrades gracefully to a placeholder narrative rather than blocking reporting if the AI call fails; risk_rating stays accurate even on AI failure since it was never AI-derived.",
+      "notesInFlow": false
+    },
+    {
+      "id": "risk_threshold_exceeded",
+      "name": "Risk Threshold Exceeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        500,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{$json.risk_rating}}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{$json.risk_rating}}",
+              "rightValue": "CRITICAL",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{$json.critical_fail}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "notes": "TRUE -> page the team + file tickets. FALSE -> routine, non-paging summary only.",
+      "notesInFlow": false
+    },
+    {
+      "id": "slack___critical_alert",
+      "name": "Slack - Critical Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        740,
+        260
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa-critical-alerts"
+        },
+        "text": "={{ ':rotating_light: *' + $json.headline + '*\\nRisk: ' + $json.risk_rating + ' (score ' + $json.risk_score + ') | Pass ' + $json.counts.pass + ' / Fail ' + $json.counts.fail + ' / Flaky ' + $json.counts.flaky + ' / Needs Review ' + $json.counts.needs_review + '\\nRun: ' + $json.run_id + '\\n' + $json.narrative + (($json.chronic_flaky && $json.chronic_flaky.length) ? ('\\n:warning: ' + $json.chronic_flaky.length + ' chronically flaky test(s)') : '') + (($json.recurring_issues && $json.recurring_issues.length) ? ('\\n:repeat: ' + $json.recurring_issues.length + ' recurring issue(s) across builds') : '') + '\\n<!here>' }}",
+        "otherOptions": {}
+      },
+      "notes": "Pages the QA-critical channel with @here. Requires a Slack Bot credential with chat:write scope.",
+      "notesInFlow": false
+    },
+    {
+      "id": "split_failure_clusters",
+      "name": "Split Failure Clusters",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function hashStr(s) {\n  let h = 5381;\n  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) + s.charCodeAt(i);\n  return Math.abs(h).toString(36);\n}\nconst data = $json;\nconst items = [];\nfor (const [category, failures] of Object.entries(data.clusters || {})) {\n  const testIds = failures.map(f => f.test_id).sort().join(',');\n  const label = `qa-cluster-${category.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${hashStr(testIds)}`;\n  items.push({ json: { run_id: data.run_id, root_cause_category: category, failures, count: failures.length, cluster_label: label } });\n}\nreturn items;"
+      },
+      "notes": "One item per FAILURE CLUSTER (grouped by root_cause_category), not one per test \\u2014 prevents ticket storms during a systemic outage. Also computes a stable cluster_label (deterministic hash of the category + sorted test_ids) used by 'Search Existing Jira Ticket' to detect whether this exact cluster already has an open ticket from a prior run, instead of filing a duplicate every night.",
+      "notesInFlow": false
+    },
+    {
+      "id": "create_jira_tickets",
+      "name": "Create Jira Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_DOMAIN.atlassian.net/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  fields: {\n    project: { key: 'QA' },\n    issuetype: { name: 'Bug' },\n    summary: 'Regression: ' + $('Split Failure Clusters').item.json.root_cause_category + ' (' + $('Split Failure Clusters').item.json.count + ' tests) - run ' + $('Split Failure Clusters').item.json.run_id,\n    description: JSON.stringify($('Split Failure Clusters').item.json.failures, null, 2),\n    labels: [ $('Split Failure Clusters').item.json.cluster_label ]\n  }\n} }}",
+        "options": {}
+      },
+      "notes": "Only reached when 'Ticket Exists?' found no open ticket for this cluster_label. Tags the new issue with the cluster_label so future runs recognize it via 'Search Existing Jira Ticket' instead of filing a duplicate. Requires a Jira credential (email + API token, Basic Auth) scoped to the QA project. Replace YOUR_DOMAIN and project key.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "slack___routine_summary",
+      "name": "Slack - Routine Summary",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        740,
+        640
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa-regression"
+        },
+        "text": "={{ ':white_check_mark: *' + $json.headline + '*\\nRisk: ' + $json.risk_rating + ' (score ' + $json.risk_score + ') | Pass ' + $json.counts.pass + ' / Fail ' + $json.counts.fail + ' / Flaky ' + $json.counts.flaky + ' / Needs Review ' + $json.counts.needs_review + '\\nRun: ' + $json.run_id + '\\n' + $json.narrative + (($json.chronic_flaky && $json.chronic_flaky.length) ? ('\\n:warning: ' + $json.chronic_flaky.length + ' chronically flaky test(s)') : '') + (($json.recurring_issues && $json.recurring_issues.length) ? ('\\n:repeat: ' + $json.recurring_issues.length + ' recurring issue(s) across builds') : '') }}",
+        "otherOptions": {}
+      },
+      "notes": "Non-paging routine summary posted after every run.",
+      "notesInFlow": false
+    },
+    {
+      "id": "store_run_history",
+      "name": "Store Run History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1220,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO qa_run_history (run_id, started_at, pass_count, fail_count, flaky_count, needs_review_count, risk_rating, risk_score, narrative)\nVALUES (\n  '={{$(\"Parse Summary JSON\").first().json.run_id}}',\n  now(),\n  {{$(\"Parse Summary JSON\").first().json.counts.pass}},\n  {{$(\"Parse Summary JSON\").first().json.counts.fail}},\n  {{$(\"Parse Summary JSON\").first().json.counts.flaky}},\n  {{$(\"Parse Summary JSON\").first().json.counts.needs_review}},\n  '={{$(\"Parse Summary JSON\").first().json.risk_rating}}',\n  {{$(\"Parse Summary JSON\").first().json.risk_score}},\n  '={{$(\"Parse Summary JSON\").first().json.narrative.replace(/'\\''/g, \"''\")}}'\n);",
+        "options": {}
+      },
+      "notes": "Persists run-level history for trend analysis regardless of which reporting branch fired, including the deterministic risk_score. See README for the qa_suggested_updates and qa_test_run_history tables written by other nodes in this run.",
+      "notesInFlow": false
+    },
+    {
+      "id": "triggered_by_webhook",
+      "name": "Triggered By Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1460,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{$('Initialize Run').first().json.source}}",
+              "rightValue": "webhook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "notes": "Only a webhook-triggered run has a waiting HTTP connection to respond to.",
+      "notesInFlow": false
+    },
+    {
+      "id": "respond_to_webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        1700,
+        340
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  run_id: $('Parse Summary JSON').first().json.run_id,\n  risk_rating: $('Parse Summary JSON').first().json.risk_rating,\n  risk_score: $('Parse Summary JSON').first().json.risk_score,\n  pass_count: $('Parse Summary JSON').first().json.counts.pass,\n  fail_count: $('Parse Summary JSON').first().json.counts.fail,\n  headline: $('Parse Summary JSON').first().json.headline\n} }}",
+        "options": {}
+      },
+      "notes": "Lets a CI/CD pipeline gate a deploy on this run's result.",
+      "notesInFlow": false
+    },
+    {
+      "id": "route_test_source",
+      "name": "Route Test Source",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -920,
+        -260
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.test_source}}",
+              "rightValue": "git",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "TRUE -> load tests from the git-backed JSON source ('test-as-code'). FALSE (default) -> load from the Google Sheet, unchanged from v1.",
+      "notesInFlow": false
+    },
+    {
+      "id": "load_test_suite_git",
+      "name": "Load Test Suite (Git)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        -420
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://raw.githubusercontent.com/REPLACE_WITH_ORG/REPLACE_WITH_REPO/main/qa/test-suite.json",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "notes": "Test-as-code alternative to the Google Sheet: reads a JSON file (same 'test_cases' array shape as sample_test_suite.json) from a git raw URL, so a team can version/PR-review test changes instead of editing a spreadsheet. For a private repo, add a Header Auth credential with a PAT. YAML is not parsed by default (no external dependency available in the sandboxed Code node) — keep the file as JSON, or enable NODE_FUNCTION_ALLOW_EXTERNAL=js-yaml on your n8n instance and adapt 'Parse Git Test Suite' to parse YAML.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "parse_git_test_suite",
+      "name": "Parse Git Test Suite",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        -420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const body = $json;\nconst cases = (body && body.test_cases) || (Array.isArray(body) ? body : []);\nreturn cases.map(tc => ({ json: {\n  ...tc,\n  tags: Array.isArray(tc.tags) ? tc.tags.join(',') : (tc.tags || ''),\n  active: String(tc.active)\n} }));"
+      },
+      "notes": "Maps the git-backed test_cases[] into the same row shape 'Validate & Filter Tests' expects from the Sheet (tags as comma-string, active as string) so downstream logic is identical regardless of test source.",
+      "notesInFlow": false
+    },
+    {
+      "id": "load_recent_test_history",
+      "name": "Load Recent Test History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -460,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT test_id, run_id, build_id, verdict, root_cause_category, priority, created_at\nFROM (\n  SELECT *,\n         ROW_NUMBER() OVER (PARTITION BY test_id ORDER BY created_at DESC) AS rn\n  FROM qa_test_run_history\n) ranked\nWHERE rn <= 5\nORDER BY test_id, created_at DESC;",
+        "options": {}
+      },
+      "notes": "Feeds cross-run pattern intelligence: pulls the last 5 runs per test_id from qa_test_run_history (see README for schema) so Aggregate Run Results can detect chronically flaky tests and root causes that recur across builds, not just within this run. Requires the same Postgres credential as Store Run History.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "compute_risk_score",
+      "name": "Compute Risk Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        340
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const agg = $json;\nlet score = 0;\nscore += agg.counts.fail * 15;\nscore += agg.counts.needs_review * 8;\nscore += agg.counts.flaky * 3;\nscore += (agg.recurring_issues || []).length * 12;\nscore += (agg.chronic_flaky || []).length * 5;\nif (agg.critical_fail) score += 40;\nscore = Math.min(100, score);\n\nlet risk_rating;\nif (agg.critical_fail || score >= 70) risk_rating = 'CRITICAL';\nelse if (score >= 40) risk_rating = 'HIGH';\nelse if (score >= 15) risk_rating = 'MEDIUM';\nelse risk_rating = 'LOW';\n\nreturn [{ json: { ...agg, risk_score: score, risk_rating } }];"
+      },
+      "notes": "Risk rating is computed deterministically from counts, critical-path failures, and cross-run signals (chronic flaky / recurring issues) — NOT chosen by the LLM. This keeps the go/no-go signal reproducible and auditable; the executive summary AI only narrates around this fixed number, it cannot pick a different rating. Tune the weights/thresholds here to match your risk appetite.",
+      "notesInFlow": false
+    },
+    {
+      "id": "flatten_suggested_updates",
+      "name": "Flatten Suggested Updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function sqlStr(v) {\n  if (v == null) return 'NULL';\n  if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, \"''\")}'::jsonb`;\n  return `'${String(v).replace(/'/g, \"''\")}'::jsonb`;\n}\nfunction sqlLiteral(v) {\n  return v == null ? 'NULL' : `'${String(v).replace(/'/g, \"''\")}'`;\n}\nconst agg = $json;\nconst rows = [];\nfor (const s of ((agg.suggested_updates && agg.suggested_updates.auto_apply) || [])) rows.push({ ...s, auto_applied: true, reviewed: true });\nfor (const s of ((agg.suggested_updates && agg.suggested_updates.manual_review) || [])) rows.push({ ...s, auto_applied: false, reviewed: false });\n\nreturn rows.map(s => ({ json: {\n  run_id_sql: sqlLiteral(s.run_id),\n  test_id_sql: sqlLiteral(s.test_id),\n  field_sql: sqlLiteral(s.field),\n  old_expected_sql: sqlStr(s.old_expected),\n  suggested_expected_sql: sqlStr(s.suggested_expected),\n  reasoning_sql: sqlLiteral(s.reasoning),\n  confidence: s.confidence == null ? 'NULL' : Number(s.confidence),\n  auto_applied: s.auto_applied,\n  reviewed: s.reviewed\n} }));"
+      },
+      "notes": "Flattens both auto_apply and manual_review suggestion lists into one row per suggestion, every value pre-escaped/pre-quoted for the raw-SQL INSERT in 'Insert Suggested Updates'. Every STALE_EXPECTATION suggestion is recorded here regardless of whether it was auto-applied \\u2014 the audit trail is never partial.",
+      "notesInFlow": false
+    },
+    {
+      "id": "insert_suggested_updates",
+      "name": "Insert Suggested Updates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        620
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO qa_suggested_updates (run_id, test_id, field, old_expected, suggested_expected, reasoning, confidence, auto_applied, reviewed)\nVALUES ({{$json.run_id_sql}}, {{$json.test_id_sql}}, {{$json.field_sql}}, {{$json.old_expected_sql}}, {{$json.suggested_expected_sql}}, {{$json.reasoning_sql}}, {{$json.confidence}}, {{$json.auto_applied}}, {{$json.reviewed}});",
+        "options": {}
+      },
+      "notes": "Persists every stale-expectation suggestion (auto-applied or not) for human review/trend analysis. Requires the qa_suggested_updates.auto_applied column added per README. No-op if there were zero suggestions this run (0 input items).",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "prepare_auto_apply_sheet_rows",
+      "name": "Prepare Auto-Apply Sheet Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        900
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const agg = $json;\nconst autoApply = (agg.suggested_updates && agg.suggested_updates.auto_apply) || [];\nif (!autoApply.length) return [];\n\nconst sourceRows = $('Validate & Filter Tests').all().map(i => i.json);\nconst byTestId = Object.fromEntries(sourceRows.map(r => [r.test_id, r]));\n\nconst out = [];\nfor (const s of autoApply) {\n  const row = byTestId[s.test_id];\n  if (!row || !s.field) continue;\n  const kv = { ...(row.expected_key_values || {}), [s.field]: s.suggested_expected };\n  out.push({ json: { test_id: s.test_id, expected_key_values: JSON.stringify(kv) } });\n}\nreturn out;"
+      },
+      "notes": "Only tests_ids in suggested_updates.auto_apply reach here (confidence >= 0.95, non-critical, non-monetary field, single unambiguous mismatch \\u2014 see Aggregate Run Results). Patches just the one field that changed onto the test's existing expected_key_values (never invents a full new object) and re-serializes to the JSON-string form the sheet stores. Nothing here writes anywhere \\u2014 the actual mutation happens in 'Update Test Suite (Auto-Apply)', a plain n8n node acting on this parsed data, consistent with the 'AI never has write access' safety rule in README.",
+      "notesInFlow": false
+    },
+    {
+      "id": "update_test_suite_auto_apply",
+      "name": "Update Test Suite (Auto-Apply)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        220,
+        900
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "Test Suite"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "test_id"
+          ],
+          "value": {
+            "test_id": "={{$json.test_id}}",
+            "expected_key_values": "={{$json.expected_key_values}}"
+          }
+        },
+        "options": {}
+      },
+      "notes": "Auto-applies only the pre-screened high-confidence, non-critical, non-monetary stale-expectation fixes directly to the live Test Suite sheet, matched by test_id. Everything else stays in qa_suggested_updates for manual review \\u2014 the live suite is never bulk-rewritten. Set documentId to the same sheet as 'Load Test Suite' (step 2 in README applies here too). No-op if there were zero auto-apply candidates.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "prepare_test_history_rows",
+      "name": "Prepare Test History Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        1180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function sqlLiteral(v) {\n  return v == null ? 'NULL' : `'${String(v).replace(/'/g, \"''\")}'`;\n}\nconst results = $('Batch Controller').all().map(i => i.json);\nreturn results.map(r => ({ json: {\n  run_id_sql: sqlLiteral(r.run_id),\n  test_id_sql: sqlLiteral(r.test_id),\n  build_id_sql: sqlLiteral(r.build_id),\n  verdict_sql: sqlLiteral(r.verdict),\n  root_cause_category_sql: sqlLiteral(r.root_cause_category),\n  priority_sql: sqlLiteral(r.priority)\n} }));"
+      },
+      "notes": "One row per test result from this run, pre-quoted for the raw-SQL insert. This is what 'Load Recent Test History' reads back on the NEXT run to detect chronic flakiness and recurring root causes \\u2014 without this write, cross-run intelligence would have no history to look at.",
+      "notesInFlow": false
+    },
+    {
+      "id": "insert_test_history",
+      "name": "Insert Test History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        1180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO qa_test_run_history (run_id, test_id, build_id, verdict, root_cause_category, priority)\nVALUES ({{$json.run_id_sql}}, {{$json.test_id_sql}}, {{$json.build_id_sql}}, {{$json.verdict_sql}}, {{$json.root_cause_category_sql}}, {{$json.priority_sql}});",
+        "options": {}
+      },
+      "notes": "Persists per-test history for the cross-run pattern intelligence feature. Requires the qa_test_run_history table (see README).",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "search_existing_jira_ticket",
+      "name": "Search Existing Jira Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://YOUR_DOMAIN.atlassian.net/rest/api/3/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "jql",
+              "value": "={{ 'project = QA AND labels = \"' + $json.cluster_label + '\" AND statusCategory != Done' }}"
+            },
+            {
+              "name": "maxResults",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Looks for an already-open Jira ticket carrying this cluster's stable label before filing a new one. Requires the same Jira credential as ticket creation; replace YOUR_DOMAIN.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "ticket_exists",
+      "name": "Ticket Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1220,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.total}}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "TRUE -> an open ticket for this exact cluster already exists from a previous run; comment on it instead of duplicating. FALSE -> no matching open ticket; create a new one.",
+      "notesInFlow": false
+    },
+    {
+      "id": "comment_on_existing_ticket",
+      "name": "Comment on Existing Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1460,
+        340
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://YOUR_DOMAIN.atlassian.net/rest/api/3/issue/' + $json.issues[0].key + '/comment' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  body: {\n    type: 'doc',\n    version: 1,\n    content: [{\n      type: 'paragraph',\n      content: [{ type: 'text', text: 'Still failing as of run ' + $('Split Failure Clusters').item.json.run_id + ': ' + $('Split Failure Clusters').item.json.count + ' test(s), root cause ' + $('Split Failure Clusters').item.json.root_cause_category + '.' }]\n    }]\n  }\n} }}",
+        "options": {}
+      },
+      "notes": "Avoids ticket-storm-across-nights: instead of a fresh Jira issue every run a recurring cluster stays unresolved, this appends a 'still failing as of run X' comment to the existing issue found by 'Search Existing Jira Ticket'. Replace YOUR_DOMAIN.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    },
+    {
+      "id": "is_ui_test",
+      "name": "Is UI Test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1020,
+        20
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.test_type}}",
+              "rightValue": "ui",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "Routes UI test escalations to the multimodal visual-diff adjudicator (screenshots) instead of the text-only semantic diff, since a screenshot_match_score float alone can't explain WHAT changed visually.",
+      "notesInFlow": false
+    },
+    {
+      "id": "claude___visual_diff",
+      "name": "Claude - Visual Diff",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1260,
+        -60
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'claude-sonnet-5',\n  max_tokens: 1024,\n  temperature: 0,\n  system: 'You are a senior QA engineer adjudicating one UI regression test using screenshots. You are given a baseline (expected) screenshot and a current (actual) screenshot as images, plus JSON metadata. Fields listed in dynamic_fields are EXPECTED to vary (e.g. a rotating promo banner) and must never by themselves cause a FAIL. Describe concretely what visually changed, if anything, then judge whether it is a real regression. Respond with STRICT JSON ONLY, no prose, no markdown fences, matching exactly this shape: {\\\"verdict\\\":\\\"PASS|FAIL|FLAKY|NEEDS_REVIEW\\\",\\\"confidence\\\":0.0,\\\"root_cause_category\\\":\\\"REGRESSION|FLAKY|TEST_DATA_ISSUE|ENV_ISSUE|STALE_EXPECTATION|null\\\",\\\"reasoning\\\":\\\"...\\\",\\\"suggested_expected_value\\\":null,\\\"visual_diff_description\\\":\\\"...\\\"}',\n  messages: [{\n    role: 'user',\n    content: [\n      { type: 'text', text: JSON.stringify({\n          test_id: $json.test_id,\n          test_name: $json.test_name,\n          priority: $json.priority,\n          dynamic_fields: $json.dynamic_fields,\n          expected_key_values: $json.expected_key_values,\n          deterministic_mismatches: $json.mismatches\n        }) },\n      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: $json.actual.body.baseline_screenshot_base64 } },\n      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: $json.actual.body.current_screenshot_base64 } }\n    ]\n  }]\n} }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "notes": "Only reached for test_type=ui escalations. Requires the external UI runner (Trigger UI Runner) to return baseline_screenshot_base64 and current_screenshot_base64 (PNG base64) alongside screenshot_match_score \\u2014 extend your Playwright/Selenium microservice contract to include these. Same strict-JSON verdict contract as Claude - Semantic Diff, plus an extra visual_diff_description field. temperature=0 for reproducibility. Requires the same Anthropic credential as the other Claude nodes.",
+      "notesInFlow": false,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Trigger Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CI/CD Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Trigger Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Trigger Input": {
+      "main": [
+        [
+          {
+            "node": "Initialize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Run": {
+      "main": [
+        [
+          {
+            "node": "Route Test Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Test Suite": {
+      "main": [
+        [
+          {
+            "node": "Validate & Filter Tests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Filter Tests": {
+      "main": [
+        [
+          {
+            "node": "Batch Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Controller": {
+      "main": [
+        [
+          {
+            "node": "Load Recent Test History",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route by Test Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Test Type": {
+      "main": [
+        [
+          {
+            "node": "Execute API Test",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute DB Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Trigger UI Runner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute API Test": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute DB Query": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger UI Runner": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result Shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Result Shape": {
+      "main": [
+        [
+          {
+            "node": "Deterministic Assertion Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deterministic Assertion Engine": {
+      "main": [
+        [
+          {
+            "node": "Needs AI Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs AI Review?": {
+      "main": [
+        [
+          {
+            "node": "Is UI Test?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Final Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Semantic Diff": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Verdict": {
+      "main": [
+        [
+          {
+            "node": "Merge Final Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Final Verdict": {
+      "main": [
+        [
+          {
+            "node": "Batch Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Run Results": {
+      "main": [
+        [
+          {
+            "node": "Compute Risk Score",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Flatten Suggested Updates",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Auto-Apply Sheet Rows",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Test History Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Executive Summary": {
+      "main": [
+        [
+          {
+            "node": "Parse Summary JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Summary JSON": {
+      "main": [
+        [
+          {
+            "node": "Risk Threshold Exceeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Threshold Exceeded?": {
+      "main": [
+        [
+          {
+            "node": "Slack - Critical Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Split Failure Clusters",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Routine Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Failure Clusters": {
+      "main": [
+        [
+          {
+            "node": "Search Existing Jira Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Critical Alert": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Jira Tickets": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Routine Summary": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Run History": {
+      "main": [
+        [
+          {
+            "node": "Triggered By Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triggered By Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Test Source": {
+      "main": [
+        [
+          {
+            "node": "Load Test Suite (Git)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Test Suite",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Test Suite (Git)": {
+      "main": [
+        [
+          {
+            "node": "Parse Git Test Suite",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Git Test Suite": {
+      "main": [
+        [
+          {
+            "node": "Validate & Filter Tests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Recent Test History": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Run Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Risk Score": {
+      "main": [
+        [
+          {
+            "node": "Claude - Executive Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Suggested Updates": {
+      "main": [
+        [
+          {
+            "node": "Insert Suggested Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Auto-Apply Sheet Rows": {
+      "main": [
+        [
+          {
+            "node": "Update Test Suite (Auto-Apply)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Test History Rows": {
+      "main": [
+        [
+          {
+            "node": "Insert Test History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Existing Jira Ticket": {
+      "main": [
+        [
+          {
+            "node": "Ticket Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ticket Exists?": {
+      "main": [
+        [
+          {
+            "node": "Comment on Existing Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Jira Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comment on Existing Ticket": {
+      "main": [
+        [
+          {
+            "node": "Store Run History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is UI Test?": {
+      "main": [
+        [
+          {
+            "node": "Claude - Visual Diff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claude - Semantic Diff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Visual Diff": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Hybrid deterministic + AI (Claude) regression testing agent. See ARCHITECTURE.md and README.md for setup and design rationale."
+  }
+}

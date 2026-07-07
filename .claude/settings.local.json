@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Cody$/TechStack/Projects/Portfolio Projects_Test Automation/Github_Projects/Competitor_agent/**)",
+      "Bash(mkdir -p competitor-intel-agent/clients competitor-intel-agent/src competitor-intel-agent/tests/fixtures competitor-intel-agent/.github/workflows competitor-intel-agent/data/briefings)",
+      "Read(//c/Users/Cody$/TechStack/Projects/Portfolio Projects_Test Automation/Github_Projects/Competitor_agent/competitor-intel-agent/**)",
+      "Bash(python -m pip install --quiet pydantic email-validator PyYAML)",
+      "Bash(python -m src.config clients/sample_client.yaml)",
+      "Bash(python -m src.config clients/does_not_exist.yaml)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import requests; print\\(requests.__version__\\)\")",
+      "Bash(python -c \"import dotenv; print\\('dotenv ok'\\)\")",
+      "Bash(python \"/c/Users/Jay/AppData/Local/Temp/claude/C--Users-Cody--TechStack-Projects-Portfolio-Projects-Test-Automation-Github-Projects-AI-Workflow/d67322e7-e19e-43e3-ac9c-1a295a5441e1/scratchpad/verify_ingest.py\")",
+      "Bash(python *)",
+      "Bash(find data *)",
+      "Bash(ls -la data data/briefings)",
+      "Bash(rm \"/c/Users/Cody\\\\$/TechStack/Projects/Portfolio Projects_Test Automation/Github_Projects/Competitor_agent/competitor-intel-agent/.github/workflows/.gitkeep\")",
+      "Read(//c/Users/Cody$/TechStack/Projects/Portfolio Projects_Test Automation/Github_Projects/Competitor_agent/competitor-intel-agent/.github/workflows/**)",
+      "Bash(rm -rf \"/c/Users/Jay/AppData/Local/Temp/claude/phase10_verify\" \"/c/Users/Jay/AppData/Local/Temp/claude/C--Users-Cody--TechStack-Projects-Portfolio-Projects-Test-Automation-Github-Projects-AI-Workflow/d67322e7-e19e-43e3-ac9c-1a295a5441e1/scratchpad/verify_phase10.py\")",
+      "Bash(timeout 300 python -m src.main --client sample_client --dry-run)",
+      "Bash(echo \"EXIT CODE: $?\")",
+      "Bash(timeout 300 python -m src.main --client sample_client)",
+      "Bash(timeout 120 python -m src.main --client sample_client)",
+      "Bash(rm -f \"/c/Users/Jay/AppData/Local/Temp/claude/C--Users-Cody--TechStack-Projects-Portfolio-Projects-Test-Automation-Github-Projects-AI-Workflow/d67322e7-e19e-43e3-ac9c-1a295a5441e1/scratchpad/regen_pdf.py\")",
+      "Bash(gh auth *)",
+      "Bash(gh --version)",
+      "Bash(gh repo *)"
+    ]
+  }
+}
